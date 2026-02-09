@@ -60,6 +60,21 @@ DONE
 27. subscribe using multiplexing and batching to all these symbols capturing price, funding rate, orderbook depth, bid/ask and other nessecary parameters to avoid rate limits using redis-server. 
  this feature should execute the subscribing as fast as possible without achieving rate limit issues. Once data is flowing through the redis server it should be fetched at a speed we avoid rate limit issues.
 
+28. Implement test functionality showing top 20 highest funding rate accross exchanges
+
+29. Section of algorithm:
+
+Execution Scope: Should the bot actually execute trades (place orders on exchanges), or should it just identify opportunities and log them for manual review? for now we're only focussing on the strategy.
+- We will develop a monitor screen so we can see the filtered out pairs but no live trading yet. 
+Confluence Metrics Priority: Of the 6 metrics you mentioned (Funding Delta, Order Book Imbalance, Open Interest, VWAP Deviation, Volatility, Liquidation Clusters), which ones are critical vs. nice-to-have? Some require additional data collection. 
+- If so we will change the script so the data collection is added 
+Confidence Score Threshold: What confidence score (0-100) should trigger a trade? Should this be configurable?:
+-we put a weight on each metric and if score is a certain number we have to determine makes sense we trigger a trade. The goal is to have pretty much no losing trades or if they go losing we immediately trigger a sl. the goal is to have a low risk system.
+Position Sizing: How should position size be determined? Fixed amount, percentage of capital, or based on spread size?:
+-this we will implement later together with live trading 
+Risk Management: What are your stop-loss rules? Should the bot exit if the spread widens beyond a threshold, or only on liquidation clusters?:
+-We don't want losing trades to exist. If that's a possibility. I'd like you to reseearch if this is possible and how to achieve this.
+
 Here are links you can visit for information you may need. Don't visit them all unless you need additional information:
 
 bybit flow

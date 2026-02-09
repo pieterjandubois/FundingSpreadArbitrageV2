@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2980c07fd422ab1b8fc75d82b5339f5f5bd3b589db8eb9da02b62f04f4bb6617 # shrinks to profits = [2183.800145393738], leg_out_losses = []
+cc e4cefdc32a41822ed6bd041a709f66e1523bb5844ef12b242c7ed8047d2d8ef5 # shrinks to long_exchange = "lighter", short_exchange = "lighter"
+cc 9e1fd13b4ab2a1ff502edc805f0f1b1926187094ac813de481c84f7c3e018253 # shrinks to long_exchange = "binance", short_exchange = "binance"

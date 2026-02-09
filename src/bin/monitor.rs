@@ -8,6 +8,18 @@ const REDIS_URL: &str = "redis://127.0.0.1:6379";
 
 type DynError = Box<dyn Error + Send + Sync>;
 
+// Map exchanges to their Redis key patterns for bid/ask data
+fn get_bid_ask_key_patterns(exchange: &str) -> Vec<&'static str> {
+    match exchange {
+        "binance" => vec!["binance:usdm:book:"],
+        "okx" => vec!["okx:usdt:tickers:"],
+        "hyperliquid" => vec!["hyperliquid:usdc:bbo:"],
+        "kucoin" => vec!["kucoin:futures:tickerV2:"],
+        "paradex" => vec!["paradex:usdt:bbo:"],
+        _ => vec![],
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
     println!("Starting funding rate monitor...\n");
@@ -31,7 +43,7 @@ async fn main() -> Result<(), DynError> {
         let mut bid_ask_data: BTreeMap<String, (String, String)> = BTreeMap::new();
         let mut funding_rates: BTreeMap<String, (f64, String, String, String)> = BTreeMap::new();
 
-        // First pass: collect bid/ask data from separate keys
+        // First pass: collect bid/ask data from all exchanges using their patterns
         for key in &keys {
             let data: String = match redis::cmd("GET").arg(&key).query_async(&mut conn).await {
                 Ok(d) => d,
@@ -43,46 +55,17 @@ async fn main() -> Result<(), DynError> {
                 Err(_) => continue,
             };
 
-            // Binance book data
-            if key.starts_with("binance:usdm:book:") {
-                if let Some(ticker) = key.strip_prefix("binance:usdm:book:") {
-                    let parser = get_parser("binance");
-                    if let Some(data) = parser.extract_all("binance", &v) {
-                        if let (Some(bid), Some(ask)) = (data.bid, data.ask) {
-                            bid_ask_data.insert(format!("binance-{}", ticker), (bid, ask));
-                        }
-                    }
-                }
-            }
-            // OKX tickers data
-            else if key.starts_with("okx:usdt:tickers:") {
-                if let Some(ticker) = key.strip_prefix("okx:usdt:tickers:") {
-                    let parser = get_parser("okx");
-                    if let Some(data) = parser.extract_all("okx", &v) {
-                        if let (Some(bid), Some(ask)) = (data.bid, data.ask) {
-                            bid_ask_data.insert(format!("okx-{}", ticker), (bid, ask));
-                        }
-                    }
-                }
-            }
-            // Hyperliquid bbo data
-            else if key.starts_with("hyperliquid:usdc:bbo:") {
-                if let Some(ticker) = key.strip_prefix("hyperliquid:usdc:bbo:") {
-                    let parser = get_parser("hyperliquid");
-                    if let Some(data) = parser.extract_all("hyperliquid", &v) {
-                        if let (Some(bid), Some(ask)) = (data.bid, data.ask) {
-                            bid_ask_data.insert(format!("hyperliquid-{}", ticker), (bid, ask));
-                        }
-                    }
-                }
-            }
-            // Kucoin tickerV2 data
-            else if key.starts_with("kucoin:futures:tickerV2:") {
-                if let Some(ticker) = key.strip_prefix("kucoin:futures:tickerV2:") {
-                    let parser = get_parser("kucoin");
-                    if let Some(data) = parser.extract_all("kucoin", &v) {
-                        if let (Some(bid), Some(ask)) = (data.bid, data.ask) {
-                            bid_ask_data.insert(format!("kucoin-{}", ticker), (bid, ask));
+            // Check each exchange's bid/ask patterns
+            for exchange in &["binance", "okx", "hyperliquid", "kucoin", "paradex"] {
+                for pattern in get_bid_ask_key_patterns(exchange) {
+                    if key.starts_with(pattern) {
+                        if let Some(ticker) = key.strip_prefix(pattern) {
+                            let parser = get_parser(exchange);
+                            if let Some(data) = parser.extract_all(exchange, &v) {
+                                if let (Some(bid), Some(ask)) = (data.bid, data.ask) {
+                                    bid_ask_data.insert(format!("{}-{}", exchange, ticker), (bid, ask));
+                                }
+                            }
                         }
                     }
                 }
@@ -128,69 +111,13 @@ async fn main() -> Result<(), DynError> {
             if let Some(data) = parser.extract_all(exchange, &v) {
                 if let Some(rate) = data.funding_rate {
                     if rate != 0.0 {
-                        // Try to get bid/ask from separate keys
-                        let (bid, ask) = match exchange {
-                            "binance" => {
-                                if key.starts_with("binance:usdm:mark:") {
-                                    if let Some(ticker) = key.strip_prefix("binance:usdm:mark:") {
-                                        bid_ask_data.get(&format!("binance-{}", ticker))
-                                            .map(|(b, a)| (b.clone(), a.clone()))
-                                            .unwrap_or_else(|| ("N/A".to_string(), "N/A".to_string()))
-                                    } else {
-                                        ("N/A".to_string(), "N/A".to_string())
-                                    }
-                                } else {
-                                    ("N/A".to_string(), "N/A".to_string())
-                                }
-                            }
-                            "okx" => {
-                                if key.starts_with("okx:usdt:funding:") {
-                                    if let Some(ticker) = key.strip_prefix("okx:usdt:funding:") {
-                                        bid_ask_data.get(&format!("okx-{}", ticker))
-                                            .map(|(b, a)| (b.clone(), a.clone()))
-                                            .unwrap_or_else(|| ("N/A".to_string(), "N/A".to_string()))
-                                    } else {
-                                        ("N/A".to_string(), "N/A".to_string())
-                                    }
-                                } else {
-                                    ("N/A".to_string(), "N/A".to_string())
-                                }
-                            }
-                            "hyperliquid" => {
-                                if key.starts_with("hyperliquid:usdc:funding:") || key.starts_with("hyperliquid:usdc:ctx:") {
-                                    if let Some(ticker) = key.strip_prefix("hyperliquid:usdc:funding:")
-                                        .or_else(|| key.strip_prefix("hyperliquid:usdc:ctx:"))
-                                    {
-                                        bid_ask_data.get(&format!("hyperliquid-{}", ticker))
-                                            .map(|(b, a)| (b.clone(), a.clone()))
-                                            .unwrap_or_else(|| ("N/A".to_string(), "N/A".to_string()))
-                                    } else {
-                                        ("N/A".to_string(), "N/A".to_string())
-                                    }
-                                } else {
-                                    ("N/A".to_string(), "N/A".to_string())
-                                }
-                            }
-                            "kucoin" => {
-                                if key.starts_with("kucoin:futures:funding_settlement:") {
-                                    if let Some(ticker) = key.strip_prefix("kucoin:futures:funding_settlement:")
-                                        .and_then(|s| s.split(':').next())
-                                    {
-                                        bid_ask_data.get(&format!("kucoin-{}", ticker))
-                                            .map(|(b, a)| (b.clone(), a.clone()))
-                                            .unwrap_or_else(|| ("N/A".to_string(), "N/A".to_string()))
-                                    } else {
-                                        ("N/A".to_string(), "N/A".to_string())
-                                    }
-                                } else {
-                                    ("N/A".to_string(), "N/A".to_string())
-                                }
-                            }
-                            _ => (
+                        // Try to get bid/ask from bid_ask_data map, fallback to parser data
+                        let (bid, ask) = bid_ask_data.get(&format!("{}-{}", exchange, data.ticker))
+                            .map(|(b, a)| (b.clone(), a.clone()))
+                            .unwrap_or_else(|| (
                                 data.bid.unwrap_or_else(|| "N/A".to_string()),
                                 data.ask.unwrap_or_else(|| "N/A".to_string()),
-                            ),
-                        };
+                            ));
 
                         funding_rates.insert(
                             format!("{}-{}", exchange.to_uppercase(), data.ticker.clone()),

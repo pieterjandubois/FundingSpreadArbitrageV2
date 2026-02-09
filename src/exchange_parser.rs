@@ -1,12 +1,14 @@
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OrderbookDepth {
     pub bids: Vec<(String, String)>,
     pub asks: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ExchangeData {
     pub exchange: String,
     pub ticker: String,
@@ -16,13 +18,24 @@ pub struct ExchangeData {
     pub orderbook_depth: Option<OrderbookDepth>,
 }
 
+
+
 pub trait ExchangeParser {
-    fn parse_ticker(&self, json: &Value) -> Option<String>;
     fn parse_funding_rate(&self, json: &Value) -> Option<f64>;
     fn parse_bid(&self, json: &Value) -> Option<String>;
     fn parse_ask(&self, json: &Value) -> Option<String>;
-    fn parse_orderbook(&self, json: &Value) -> Option<OrderbookDepth>;
     
+    #[allow(dead_code)]
+    fn parse_ticker(&self, _json: &Value) -> Option<String> {
+        None
+    }
+    
+    #[allow(dead_code)]
+    fn parse_orderbook(&self, _json: &Value) -> Option<OrderbookDepth> {
+        None
+    }
+    
+    #[allow(dead_code)]
     fn extract_all(&self, exchange: &str, json: &Value) -> Option<ExchangeData> {
         Some(ExchangeData {
             exchange: exchange.to_string(),
@@ -37,10 +50,6 @@ pub trait ExchangeParser {
 
 pub struct BinanceParser;
 impl ExchangeParser for BinanceParser {
-    fn parse_ticker(&self, json: &Value) -> Option<String> {
-        json.get("s").and_then(|v| v.as_str()).map(|s| s.to_string())
-    }
-    
     fn parse_funding_rate(&self, json: &Value) -> Option<f64> {
         json.get("r").and_then(|v| v.as_str()).and_then(|r| r.parse().ok())
     }
@@ -52,21 +61,10 @@ impl ExchangeParser for BinanceParser {
     fn parse_ask(&self, json: &Value) -> Option<String> {
         json.get("a").and_then(|v| v.as_str()).map(|s| s.to_string())
     }
-    
-    fn parse_orderbook(&self, _json: &Value) -> Option<OrderbookDepth> {
-        None
-    }
 }
 
 pub struct BybitParser;
 impl ExchangeParser for BybitParser {
-    fn parse_ticker(&self, json: &Value) -> Option<String> {
-        json.get("data")
-            .and_then(|d| d.get("symbol"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-    
     fn parse_funding_rate(&self, json: &Value) -> Option<f64> {
         json.get("data")
             .and_then(|d| {
@@ -94,23 +92,10 @@ impl ExchangeParser for BybitParser {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     }
-    
-    fn parse_orderbook(&self, _json: &Value) -> Option<OrderbookDepth> {
-        None
-    }
 }
 
 pub struct OKXParser;
 impl ExchangeParser for OKXParser {
-    fn parse_ticker(&self, json: &Value) -> Option<String> {
-        json.get("data")
-            .and_then(|d| d.as_array())
-            .and_then(|a| a.first())
-            .and_then(|f| f.get("instId"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-    
     fn parse_funding_rate(&self, json: &Value) -> Option<f64> {
         json.get("data")
             .and_then(|d| d.as_array())
@@ -137,21 +122,10 @@ impl ExchangeParser for OKXParser {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     }
-    
-    fn parse_orderbook(&self, _json: &Value) -> Option<OrderbookDepth> {
-        None
-    }
 }
 
 pub struct HyperliquidParser;
 impl ExchangeParser for HyperliquidParser {
-    fn parse_ticker(&self, json: &Value) -> Option<String> {
-        json.get("data")
-            .and_then(|d| d.get("coin"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-    
     fn parse_funding_rate(&self, json: &Value) -> Option<f64> {
         json.get("data")
             .and_then(|d| d.get("ctx"))
@@ -203,30 +177,10 @@ impl ExchangeParser for HyperliquidParser {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     }
-    
-    fn parse_orderbook(&self, _json: &Value) -> Option<OrderbookDepth> {
-        None
-    }
 }
 
 pub struct KucoinParser;
 impl ExchangeParser for KucoinParser {
-    fn parse_ticker(&self, json: &Value) -> Option<String> {
-        // Try data.symbol first
-        if let Some(symbol) = json.get("data")
-            .and_then(|d| d.get("symbol"))
-            .and_then(|v| v.as_str())
-        {
-            return Some(symbol.to_string());
-        }
-        
-        // Fallback to old structure
-        json.get("data")
-            .and_then(|d| d.get("symbol"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-    
     fn parse_funding_rate(&self, json: &Value) -> Option<f64> {
         json.get("data")
             .and_then(|d| d.get("fundingRate"))
@@ -252,23 +206,10 @@ impl ExchangeParser for KucoinParser {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     }
-    
-    fn parse_orderbook(&self, _json: &Value) -> Option<OrderbookDepth> {
-        None
-    }
 }
 
 pub struct BitgetParser;
 impl ExchangeParser for BitgetParser {
-    fn parse_ticker(&self, json: &Value) -> Option<String> {
-        json.get("data")
-            .and_then(|d| d.as_array())
-            .and_then(|a| a.first())
-            .and_then(|f| f.get("instId"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-    
     fn parse_funding_rate(&self, json: &Value) -> Option<f64> {
         json.get("data")
             .and_then(|d| d.as_array())
@@ -295,30 +236,10 @@ impl ExchangeParser for BitgetParser {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     }
-    
-    fn parse_orderbook(&self, _json: &Value) -> Option<OrderbookDepth> {
-        None
-    }
 }
 
 pub struct GateioParser;
 impl ExchangeParser for GateioParser {
-    fn parse_ticker(&self, json: &Value) -> Option<String> {
-        // Try tickers format first (contract field)
-        if let Some(ticker) = json.get("result")
-            .and_then(|r| r.get("contract"))
-            .and_then(|v| v.as_str())
-        {
-            return Some(ticker.to_string());
-        }
-        
-        // Fallback to book_ticker format (s field)
-        json.get("result")
-            .and_then(|r| r.get("s"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-    
     fn parse_funding_rate(&self, json: &Value) -> Option<f64> {
         json.get("result")
             .and_then(|r| r.get("funding_rate"))
@@ -356,10 +277,6 @@ impl ExchangeParser for GateioParser {
             .and_then(|r| r.get("a"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-    }
-    
-    fn parse_orderbook(&self, _json: &Value) -> Option<OrderbookDepth> {
-        None
     }
 }
 
@@ -417,14 +334,6 @@ impl ExchangeParser for LighterParser {
 
 pub struct ParadexParser;
 impl ExchangeParser for ParadexParser {
-    fn parse_ticker(&self, json: &Value) -> Option<String> {
-        json.get("params")
-            .and_then(|p| p.get("data"))
-            .and_then(|d| d.get("market"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-    
     fn parse_funding_rate(&self, json: &Value) -> Option<f64> {
         json.get("params")
             .and_then(|p| p.get("data"))
@@ -448,10 +357,6 @@ impl ExchangeParser for ParadexParser {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     }
-    
-    fn parse_orderbook(&self, _json: &Value) -> Option<OrderbookDepth> {
-        None
-    }
 }
 
 pub fn get_parser(exchange: &str) -> Box<dyn ExchangeParser> {
@@ -467,4 +372,86 @@ pub fn get_parser(exchange: &str) -> Box<dyn ExchangeParser> {
         "paradex" => Box::new(ParadexParser),
         _ => Box::new(BinanceParser),
     }
+}
+
+/// Get the Redis key patterns for a given exchange and symbol
+/// Returns a vector of possible key patterns to try (in priority order)
+pub fn get_redis_key_patterns(exchange: &str, symbol: &str) -> Vec<String> {
+    match exchange.to_lowercase().as_str() {
+        "bybit" => vec![format!("{}:linear:tickers:{}", exchange, symbol)],
+        "bitget" => vec![format!("{}:usdt:tickers:{}", exchange, symbol)],
+        "binance" => vec![
+            format!("{}:linear:tickers:{}", exchange, symbol),
+            format!("{}:usdm:book:{}", exchange, symbol),
+        ],
+        "okx" => {
+            // OKX uses format: BASE-USDT-SWAP
+            // Convert BTCUSDT -> BTC-USDT-SWAP
+            let base = symbol.trim_end_matches("USDT");
+            vec![
+                format!("{}:usdt:tickers:{}-USDT-SWAP", exchange, base),
+                format!("{}:usdt:tickers:{}", exchange, symbol),  // Fallback
+            ]
+        },
+        "kucoin" => vec![
+            format!("{}:futures:tickerV2:{}M", exchange, symbol),  // KuCoin adds M suffix
+            format!("{}:futures:tickerV2:{}", exchange, symbol),   // Fallback without M
+        ],
+        "hyperliquid" => {
+            // Hyperliquid uses format: hyperliquid:usdc:ctx:BASE (without USDT)
+            // Convert BTCUSDT -> BTC
+            let base = symbol.trim_end_matches("USDT");
+            vec![
+                format!("{}:usdc:ctx:{}", exchange, base),
+                format!("{}:usdc:bbo:{}", exchange, base),  // Fallback to bbo
+            ]
+        },
+        "gateio" => vec![format!("{}:usdt:tickers:{}", exchange, symbol)],
+        "paradex" => {
+            // Paradex uses format: BASE-USD-PERP
+            // Convert BTCUSDT -> BTC-USD-PERP
+            let base = symbol.trim_end_matches("USDT");
+            vec![
+                format!("{}:usdt:bbo:{}-USD-PERP", exchange, base),
+                format!("{}:usdt:tickers:{}", exchange, symbol),  // Fallback
+            ]
+        },
+        "lighter" => vec![format!("{}:usdt:data:{}", exchange, symbol)],
+        _ => vec![format!("{}:linear:tickers:{}", exchange, symbol)],
+    }
+}
+
+#[allow(dead_code)]
+pub fn normalize_symbol(symbol: &str) -> String {
+    let mut normalized = symbol.to_uppercase();
+    
+    // Remove dashes (OKX: LDO-USDT-SWAP, Paradex: CAKE-USD-PERP)
+    normalized = normalized.replace("-", "");
+    
+    // Remove SWAP suffix (OKX)
+    if normalized.ends_with("SWAP") {
+        normalized.truncate(normalized.len() - 4);
+    }
+    
+    // Remove PERP suffix (Paradex)
+    if normalized.ends_with("PERP") {
+        normalized.truncate(normalized.len() - 4);
+    }
+    
+    // Remove M suffix for KuCoin (MASKUSDTM -> MASKUSDT, LDOUSDTM -> LDOUSDT)
+    if normalized.ends_with("USDTM") {
+        normalized.truncate(normalized.len() - 1);
+    }
+    
+    // Normalize USD/USDT endings
+    if normalized.contains("USD") && !normalized.contains("USDT") {
+        normalized = normalized.replace("USD", "USDT");
+    }
+    
+    // If it doesn't have USDT at all (like Hyperliquid's "LDO"), add it
+    if !normalized.contains("USDT") {
+        normalized.push_str("USDT");
+    }
+    
+    normalized
 }
