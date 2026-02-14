@@ -324,6 +324,11 @@ mod tests {
                 fill_price: Some(101.0),
                 status: OrderStatus::Filled,
             },
+            long_exit_order: None,  // Test doesn't use exit orders
+            short_exit_order: None, // Test doesn't use exit orders
+            stop_loss_triggered: false,
+            stop_loss_long_price: 0.0,
+            stop_loss_short_price: 0.0,
             leg_out_event: None,
         }
     }

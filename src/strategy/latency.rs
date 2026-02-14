@@ -4,6 +4,12 @@ pub struct LatencyMonitor {
     latencies: HashMap<String, Vec<u64>>,
 }
 
+impl Default for LatencyMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LatencyMonitor {
     pub fn new() -> Self {
         Self {

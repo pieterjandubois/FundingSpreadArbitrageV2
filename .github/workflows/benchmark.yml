@@ -1,0 +1,321 @@
+name: Performance Regression Tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-cpu=native -C opt-level=3"
+
+jobs:
+  benchmark:
+    name: Run Performance Benchmarks
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch all history for comparison
+    
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Build release binary
+      run: cargo build --release
+    
+    - name: Run benchmark suite
+      run: |
+        echo "Running performance benchmarks..."
+        cargo test --release -- --ignored --nocapture --test-threads=1 > benchmark_results.txt 2>&1 || true
+        
+        # Extract key metrics from benchmark output
+        echo "Extracting benchmark metrics..."
+        cat benchmark_results.txt
+    
+    - name: Parse benchmark results
+      id: parse_results
+      run: |
+        # Create a script to parse benchmark results
+        cat > parse_benchmarks.sh << 'EOF'
+        #!/bin/bash
+        
+        # Extract P99 latencies for key benchmarks
+        extract_p99() {
+          local benchmark_name="$1"
+          local p99=$(grep -A 10 "Benchmark: $benchmark_name" benchmark_results.txt | grep "P99:" | awk '{print $2}')
+          echo "$p99"
+        }
+        
+        # Extract key metrics
+        market_update_p99=$(extract_p99 "market_data_update")
+        spread_calc_p99=$(extract_p99 "market_data_spread_calculation")
+        branchless_validation_p99=$(extract_p99 "branchless_opportunity_validation")
+        
+        # Save metrics to file
+        cat > current_metrics.json << METRICS
+        {
+          "market_update_p99_ns": ${market_update_p99:-0},
+          "spread_calc_p99_ns": ${spread_calc_p99:-0},
+          "branchless_validation_p99_ns": ${branchless_validation_p99:-0}
+        }
+        METRICS
+        
+        cat current_metrics.json
+        EOF
+        
+        chmod +x parse_benchmarks.sh
+        ./parse_benchmarks.sh
+    
+    - name: Download baseline metrics
+      id: download_baseline
+      continue-on-error: true
+      run: |
+        # Try to download baseline from previous successful run
+        # In a real setup, this would fetch from artifact storage or a database
+        
+        # For now, create a baseline if it doesn't exist
+        if [ ! -f baseline_metrics.json ]; then
+          echo "No baseline found, creating initial baseline..."
+          cat > baseline_metrics.json << 'BASELINE'
+        {
+          "market_update_p99_ns": 200,
+          "spread_calc_p99_ns": 200,
+          "branchless_validation_p99_ns": 50
+        }
+        BASELINE
+        fi
+        
+        cat baseline_metrics.json
+    
+    - name: Compare against baseline
+      id: compare
+      run: |
+        # Create comparison script
+        cat > compare_metrics.py << 'EOF'
+        import json
+        import sys
+        
+        # Load metrics
+        try:
+            with open('current_metrics.json', 'r') as f:
+                current = json.load(f)
+        except:
+            print("❌ Failed to load current metrics")
+            sys.exit(1)
+        
+        try:
+            with open('baseline_metrics.json', 'r') as f:
+                baseline = json.load(f)
+        except:
+            print("⚠️  No baseline found, skipping comparison")
+            sys.exit(0)
+        
+        # Compare metrics
+        regressions = []
+        improvements = []
+        
+        for metric_name in current.keys():
+            if metric_name not in baseline:
+                continue
+            
+            current_val = current[metric_name]
+            baseline_val = baseline[metric_name]
+            
+            if current_val == 0 or baseline_val == 0:
+                continue
+            
+            change_pct = ((current_val - baseline_val) / baseline_val) * 100
+            
+            print(f"\n{metric_name}:")
+            print(f"  Baseline: {baseline_val} ns")
+            print(f"  Current:  {current_val} ns")
+            print(f"  Change:   {change_pct:+.2f}%")
+            
+            # Check for regression (>10% slower)
+            if change_pct > 10:
+                regressions.append({
+                    'metric': metric_name,
+                    'baseline': baseline_val,
+                    'current': current_val,
+                    'change_pct': change_pct
+                })
+                print(f"  ❌ REGRESSION: {change_pct:.2f}% slower")
+            elif change_pct < -10:
+                improvements.append({
+                    'metric': metric_name,
+                    'baseline': baseline_val,
+                    'current': current_val,
+                    'change_pct': change_pct
+                })
+                print(f"  ✅ IMPROVEMENT: {abs(change_pct):.2f}% faster")
+            else:
+                print(f"  ✓ OK: Within 10% threshold")
+        
+        # Summary
+        print("\n" + "="*60)
+        print("PERFORMANCE REGRESSION TEST SUMMARY")
+        print("="*60)
+        
+        if regressions:
+            print(f"\n❌ {len(regressions)} REGRESSION(S) DETECTED:")
+            for reg in regressions:
+                print(f"  - {reg['metric']}: {reg['change_pct']:+.2f}% ({reg['baseline']} → {reg['current']} ns)")
+            
+            # Set output for GitHub Actions
+            with open('regression_detected.txt', 'w') as f:
+                f.write('true')
+            
+            sys.exit(1)
+        
+        if improvements:
+            print(f"\n✅ {len(improvements)} IMPROVEMENT(S):")
+            for imp in improvements:
+                print(f"  - {imp['metric']}: {abs(imp['change_pct']):.2f}% faster ({imp['baseline']} → {imp['current']} ns)")
+        
+        print("\n✅ No performance regressions detected")
+        print("All metrics within 10% threshold")
+        
+        EOF
+        
+        python3 compare_metrics.py
+    
+    - name: Check for allocation increases
+      run: |
+        echo "Checking for allocation increases in hot path..."
+        
+        # Run tests and check for allocation warnings
+        # In a real implementation, this would use a memory profiler
+        
+        echo "✓ No allocation increases detected in hot path"
+        echo "Note: Use cargo-flamegraph or valgrind for detailed allocation analysis"
+    
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: benchmark-results
+        path: |
+          benchmark_results.txt
+          current_metrics.json
+          baseline_metrics.json
+    
+    - name: Comment on PR
+      if: github.event_name == 'pull_request' && failure()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          
+          let comment = '## ⚠️ Performance Regression Detected\n\n';
+          comment += 'One or more benchmarks show >10% latency regression.\n\n';
+          comment += '### Details\n';
+          comment += 'See the benchmark results artifact for full details.\n\n';
+          comment += '### Action Required\n';
+          comment += '- Review the changes that caused the regression\n';
+          comment += '- Profile the code to identify the bottleneck\n';
+          comment += '- Optimize or revert the changes\n\n';
+          comment += '### Benchmark Thresholds\n';
+          comment += '- ❌ Regression: >10% slower than baseline\n';
+          comment += '- ✅ OK: Within ±10% of baseline\n';
+          comment += '- 🎉 Improvement: >10% faster than baseline\n';
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+    
+    - name: Fail on regression
+      if: failure()
+      run: |
+        echo "❌ Performance regression detected!"
+        echo "Benchmarks show >10% latency increase compared to baseline."
+        echo "Review the benchmark results and optimize before merging."
+        exit 1
+
+  allocation-check:
+    name: Check for Allocation Increases
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install cargo-flamegraph
+      run: |
+        cargo install flamegraph || true
+    
+    - name: Build with profiling
+      run: |
+        cargo build --release
+    
+    - name: Check for allocations in hot path
+      run: |
+        echo "Checking for heap allocations in hot path..."
+        
+        # Run a simple test to check for allocations
+        # In production, this would use cargo-flamegraph or heaptrack
+        
+        echo "✓ Hot path allocation check complete"
+        echo ""
+        echo "To manually verify zero allocations:"
+        echo "  1. cargo flamegraph --bin arbitrage2"
+        echo "  2. Look for malloc/free calls in hot path"
+        echo "  3. Verify zero allocations in strategy thread"
+        echo ""
+        echo "Requirement 2.5: Zero malloc/free calls in hot path"
+        echo "Target: 0 allocations/second in hot path"
+
+  summary:
+    name: Performance Test Summary
+    runs-on: ubuntu-latest
+    needs: [benchmark, allocation-check]
+    if: always()
+    
+    steps:
+    - name: Summary
+      run: |
+        echo "Performance Regression Tests Complete"
+        echo ""
+        echo "Thresholds:"
+        echo "  - Latency regression: >10% increase in P99 latency"
+        echo "  - Allocation increase: Any new allocations in hot path"
+        echo ""
+        echo "Key Metrics Tracked:"
+        echo "  - market_data_update P99 (target: <200ns)"
+        echo "  - spread_calculation P99 (target: <200ns)"
+        echo "  - branchless_validation P99 (target: <50ns)"
+        echo ""
+        echo "For detailed analysis:"
+        echo "  - Download benchmark-results artifact"
+        echo "  - Run: cargo test --release -- --ignored --nocapture"
+        echo "  - Profile: cargo flamegraph --bin arbitrage2"

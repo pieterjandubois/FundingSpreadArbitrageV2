@@ -7,6 +7,12 @@ pub struct ConfluenceCalculator {
     atr_history: VecDeque<f64>,
 }
 
+impl Default for ConfluenceCalculator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConfluenceCalculator {
     pub fn new() -> Self {
         Self {

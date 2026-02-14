@@ -50,7 +50,11 @@ impl BitgetUsdtFuturesConnector {
         Ok(())
     }
 
-    pub async fn run(client: &reqwest::Client, tx: mpsc::Sender<(String, String)>) -> Result<(), DynError> {
+    pub async fn run(
+        client: &reqwest::Client, 
+        tx: mpsc::Sender<(String, String)>,
+        _market_producer: Option<crate::strategy::pipeline::MarketProducer>,
+    ) -> Result<(), DynError> {
         Self::connection_check(client).await?;
 
         let symbols = fetch_valid_usdt_perp_symbols(client).await?;
@@ -146,16 +150,29 @@ async fn run_bitget_ws_batch(worker_id: usize, symbols: &[String], tx: mpsc::Sen
                     None => break,
                 };
 
-                if !msg.is_text() {
+                // Zero-copy WebSocket message handling (Requirement 8.1, 8.3, 8.4)
+                // Work directly with bytes, avoiding String allocation
+                let bytes = match msg {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        // Convert String to bytes (unavoidable with tungstenite's API)
+                        text.into_bytes()
+                    }
+                    tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                        // Binary messages can be used directly
+                        bytes
+                    }
+                    _ => continue,
+                };
+
+                // Skip pong messages (Bitget specific)
+                if bytes == b"pong" {
                     continue;
                 }
 
-                let text = msg.into_text()?;
-                if text == "pong" {
-                    continue;
-                }
-
-                let v: serde_json::Value = match serde_json::from_str(&text) {
+                // SIMD-accelerated JSON parsing (Requirement 8.2)
+                // Parse directly from bytes without intermediate String allocation
+                let mut bytes_mut = bytes;
+                let v: serde_json::Value = match simd_json::serde::from_slice(&mut bytes_mut) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -213,6 +230,13 @@ async fn run_bitget_ws_batch(worker_id: usize, symbols: &[String], tx: mpsc::Sen
 }
 
 async fn run_bitget_ws_worker(worker_id: usize, symbols: Arc<Vec<String>>, tx: mpsc::Sender<(String, String)>) {
+    // Pin WebSocket thread to cores 2-7 for optimal cache performance
+    // Requirement: 4.2 (Pin WebSocket threads to cores 2-7)
+    if let Err(e) = crate::strategy::thread_pinning::pin_websocket_thread(worker_id) {
+        eprintln!("[THREAD-PIN] Warning: Failed to pin Bitget worker {}: {}", worker_id, e);
+        eprintln!("[THREAD-PIN] Continuing without thread pinning (performance may be degraded)");
+    }
+    
     let mut backoff_ms: u64 = 0;
     loop {
         let res = run_bitget_ws_batch(worker_id, &symbols[..], tx.clone()).await;

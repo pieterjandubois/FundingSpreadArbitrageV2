@@ -81,13 +81,16 @@ impl AppState {
         }
     }
 
-    async fn update_from_redis(&mut self) -> Result<(), DynError> {
+    async fn update_from_redis(&mut self, redis_prefix: &str) -> Result<(), DynError> {
         let client = redis::Client::open("redis://127.0.0.1:6379")?;
         let mut conn = client.get_connection()?;
 
+        let metrics_key = format!("strategy:{}:portfolio:metrics", redis_prefix);
+        let state_key = format!("strategy:{}:portfolio:state", redis_prefix);
+
         // Fetch metrics
         if let Ok(json) = redis::cmd("GET")
-            .arg("strategy:portfolio:metrics")
+            .arg(&metrics_key)
             .query::<String>(&mut conn)
         {
             self.metrics = serde_json::from_str(&json).ok();
@@ -95,7 +98,7 @@ impl AppState {
 
         // Fetch portfolio state
         if let Ok(json) = redis::cmd("GET")
-            .arg("strategy:portfolio:state")
+            .arg(&state_key)
             .query::<String>(&mut conn)
         {
             self.state = serde_json::from_str(&json).ok();
@@ -188,6 +191,15 @@ impl AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
+    // Parse command-line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let is_demo_mode = args.contains(&"--demo".to_string());
+    let redis_prefix = if is_demo_mode { "demo" } else { "trade" };
+    
+    eprintln!("[MONITOR] Starting trading monitor in {} mode", 
+        if is_demo_mode { "DEMO" } else { "PAPER" });
+    eprintln!("[MONITOR] Redis prefix: {}", redis_prefix);
+    
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -255,7 +267,7 @@ async fn main() -> Result<(), DynError> {
 
         // Update data from Redis periodically
         if last_update.elapsed() >= update_interval {
-            let _ = app_state.update_from_redis().await;
+            let _ = app_state.update_from_redis(redis_prefix).await;
             last_update = std::time::Instant::now();
         }
 

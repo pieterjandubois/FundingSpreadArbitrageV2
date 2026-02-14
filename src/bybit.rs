@@ -1,12 +1,14 @@
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::DynError;
 use crate::utils;
+use crate::strategy::pipeline::MarketProducer;
+use crate::strategy::types::{MarketUpdate, symbol_to_id};
 
 const BYBIT_BASE_URL: &str = "https://api.bybit.com";
 const BYBIT_LINEAR_WS_PUBLIC_URL: &str = "wss://stream.bybit.com/v5/public/linear";
@@ -51,7 +53,11 @@ impl BybitLinearConnector {
         Ok(())
     }
 
-    pub async fn run(client: &reqwest::Client, tx: mpsc::Sender<(String, String)>) -> Result<(), DynError> {
+    pub async fn run(
+        client: &reqwest::Client, 
+        tx: mpsc::Sender<(String, String)>,
+        market_producer: Option<MarketProducer>,
+    ) -> Result<(), DynError> {
         Self::connection_check(client).await?;
 
         let symbols = fetch_valid_linear_symbols(client).await?;
@@ -64,7 +70,12 @@ impl BybitLinearConnector {
         println!("Starting Bybit websocket workers: {}", batches.len());
 
         for (worker_id, batch) in batches.into_iter().enumerate() {
-            tokio::spawn(run_bybit_linear_ws_worker(worker_id, Arc::new(batch), tx.clone()));
+            tokio::spawn(run_bybit_linear_ws_worker(
+                worker_id, 
+                Arc::new(batch), 
+                tx.clone(),
+                market_producer.clone(),
+            ));
         }
 
         Ok(())
@@ -113,14 +124,19 @@ async fn fetch_valid_linear_symbols(client: &reqwest::Client) -> Result<Vec<Stri
     Ok(symbols)
 }
 
-async fn run_bybit_linear_ws_batch(worker_id: usize, topics: &[String], tx: mpsc::Sender<(String, String)>) -> Result<(), DynError> {
+async fn run_bybit_linear_ws_batch(
+    worker_id: usize, 
+    topics: &[String], 
+    tx: mpsc::Sender<(String, String)>,
+    market_producer: Option<MarketProducer>,
+) -> Result<(), DynError> {
     let (ws, _) = tokio_tungstenite::connect_async(BYBIT_LINEAR_WS_PUBLIC_URL).await?;
     let (mut write, mut read) = ws.split();
 
     println!("Bybit ws[{}] connected", worker_id);
 
     let mut first_data_logged = false;
-    let mut ticker_state: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut ticker_state: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
 
     utils::subscribe_in_batches(&mut write, topics, SUBSCRIBE_BATCH_SIZE, SUBSCRIBE_BATCH_DELAY_MS, |w, chunk| {
         Box::pin(async move {
@@ -151,12 +167,24 @@ async fn run_bybit_linear_ws_batch(worker_id: usize, topics: &[String], tx: mpsc
                     None => break,
                 };
 
-                if !msg.is_text() {
-                    continue;
-                }
-
-                let text = msg.into_text()?;
-                let v: Value = match serde_json::from_str(&text) {
+                // Zero-copy WebSocket message handling (Requirement 8.1, 8.3, 8.4)
+                // Work directly with bytes, avoiding String allocation
+                let bytes = match msg {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        // Convert String to bytes (unavoidable with tungstenite's API)
+                        text.into_bytes()
+                    }
+                    tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                        // Binary messages can be used directly
+                        bytes
+                    }
+                    _ => continue,
+                };
+                
+                // SIMD-accelerated JSON parsing (Requirement 8.2)
+                // Parse directly from bytes without intermediate String allocation
+                let mut bytes_mut = bytes;
+                let v: serde_json::Value = match simd_json::serde::from_slice(&mut bytes_mut) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -179,8 +207,33 @@ async fn run_bybit_linear_ws_batch(worker_id: usize, topics: &[String], tx: mpsc
                     println!("Bybit ws[{}] first data message received", worker_id);
                 }
 
+                // HOT PATH: Push to queue if this is ticker data and we have a producer
+                if key_type == "tickers" {
+                    if let Some(ref producer) = market_producer {
+                        // Extract bid/ask from ticker data
+                        if let Some(data) = v.get("data") {
+                            if let (Some(bid), Some(ask)) = (
+                                data.get("bid1Price").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()),
+                                data.get("ask1Price").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()),
+                            ) {
+                                // Map symbol to ID
+                                if let Some(symbol_id) = symbol_to_id(symbol) {
+                                    let timestamp_us = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_micros() as u64;
+                                    
+                                    let update = MarketUpdate::new(symbol_id, bid, ask, timestamp_us);
+                                    producer.push(update);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let key = format!("bybit:linear:{}:{}", key_type, symbol);
                 
+                // COLD PATH: Still write to Redis for monitoring/dashboard
                 // For tickers, merge delta updates into state and publish incrementally
                 if key_type == "tickers" {
                     if let Some(data) = v.get("data") {
@@ -226,10 +279,22 @@ async fn run_bybit_linear_ws_batch(worker_id: usize, topics: &[String], tx: mpsc
     Ok(())
 }
 
-async fn run_bybit_linear_ws_worker(worker_id: usize, topics: Arc<Vec<String>>, tx: mpsc::Sender<(String, String)>) {
+async fn run_bybit_linear_ws_worker(
+    worker_id: usize, 
+    topics: Arc<Vec<String>>, 
+    tx: mpsc::Sender<(String, String)>,
+    market_producer: Option<MarketProducer>,
+) {
+    // Pin WebSocket thread to cores 2-7 for optimal cache performance
+    // Requirement: 4.2 (Pin WebSocket threads to cores 2-7)
+    if let Err(e) = crate::strategy::thread_pinning::pin_websocket_thread(worker_id) {
+        eprintln!("[THREAD-PIN] Warning: Failed to pin Bybit worker {}: {}", worker_id, e);
+        eprintln!("[THREAD-PIN] Continuing without thread pinning (performance may be degraded)");
+    }
+    
     let mut backoff_ms: u64 = 0;
     loop {
-        let res = run_bybit_linear_ws_batch(worker_id, &topics[..], tx.clone()).await;
+        let res = run_bybit_linear_ws_batch(worker_id, &topics[..], tx.clone(), market_producer.clone()).await;
         match &res {
             Ok(()) => println!("[{}] Bybit ws[{}] disconnected -> reconnecting", utils::ts_hm(), worker_id),
             Err(e) => println!("[{}] Bybit ws[{}] error: {} -> reconnecting", utils::ts_hm(), worker_id, e),

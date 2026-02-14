@@ -53,7 +53,11 @@ impl GateioUsdtPerpConnector {
         }
     }
 
-    pub async fn run(client: &reqwest::Client, tx: mpsc::Sender<(String, String)>) -> Result<(), DynError> {
+    pub async fn run(
+        client: &reqwest::Client, 
+        tx: mpsc::Sender<(String, String)>,
+        _market_producer: Option<crate::strategy::pipeline::MarketProducer>,
+    ) -> Result<(), DynError> {
         Self::connection_check(client).await?;
 
         let contracts = fetch_valid_usdt_contracts(client).await?;

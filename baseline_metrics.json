@@ -1,0 +1,10 @@
+{
+  "market_update_p99_ns": 200,
+  "market_update_avg_ns": 100,
+  "spread_calc_p99_ns": 200,
+  "spread_calc_avg_ns": 100,
+  "branchless_validation_p99_ns": 50,
+  "branchless_validation_avg_ns": 25,
+  "sequential_access_p99_ns": 10000,
+  "random_access_p99_ns": 1000
+}

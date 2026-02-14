@@ -1,0 +1,197 @@
+use arbitrage2::strategy::{
+    bybit_websocket::BybitWebSocketConnector,
+    market_data::MarketDataStore,
+    pipeline::MarketPipeline,
+    single_exchange_executor::SingleExchangeExecutor,
+    synthetic_config::SyntheticConfig,
+    synthetic_generator::SyntheticOpportunityGenerator,
+    test_metrics::TestMetricsCollector,
+    testnet_backend::TestnetBackend,
+    testnet_config::TestnetConfig,
+};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, RwLock,
+};
+use std::time::Duration;
+use tokio::signal;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    dotenv::dotenv().ok();
+    
+    eprintln!("=== Bybit Synthetic Test Mode ===");
+    eprintln!("Starting initialization...");
+    eprintln!("");
+    
+    // 1. Load configuration from environment
+    let config = SyntheticConfig::from_env()?;
+    eprintln!("[CONFIG] Synthetic spread: {:.2} bps", config.synthetic_spread_bps);
+    eprintln!("[CONFIG] Funding delta: {:.4}", config.synthetic_funding_delta);
+    eprintln!("[CONFIG] Position size: ${:.2}", config.estimated_position_size);
+    eprintln!("[CONFIG] Max concurrent trades: {}", config.max_concurrent_trades);
+    eprintln!("[CONFIG] Symbols: {:?}", config.symbols_to_trade);
+    eprintln!("");
+    
+    // 2. Load testnet config and initialize Bybit demo backend
+    eprintln!("[BACKEND] Initializing Bybit demo backend...");
+    let testnet_config = TestnetConfig::from_env()?;
+    let backend = Arc::new(TestnetBackend::new(testnet_config));
+    backend.sync_server_time().await?;
+    eprintln!("[BACKEND] ✅ Backend initialized and time synced");
+    eprintln!("");
+    
+    // 3. Create streaming pipeline (SPSC queue for low-latency)
+    eprintln!("[PIPELINE] Setting up streaming pipeline...");
+    let pipeline = MarketPipeline::new();
+    let producer = pipeline.producer();
+    let consumer = pipeline.consumer();
+    eprintln!("[PIPELINE] ✅ Pipeline created");
+    eprintln!("");
+    
+    // 4. Initialize shared state
+    let market_data_store = Arc::new(RwLock::new(MarketDataStore::new()));
+    let metrics = Arc::new(TestMetricsCollector::new());
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    
+    // 5. Start WebSocket thread
+    eprintln!("[WEBSOCKET] Starting WebSocket thread...");
+    let ws_symbols = config.symbols_to_trade.clone();
+    let ws_producer = producer.clone();
+    let ws_shutdown = shutdown_flag.clone();
+    
+    let ws_handle = tokio::spawn(async move {
+        let connector = BybitWebSocketConnector::new(ws_producer, ws_symbols);
+        
+        loop {
+            if ws_shutdown.load(Ordering::Relaxed) {
+                eprintln!("[WEBSOCKET] Shutdown signal received");
+                break;
+            }
+            
+            let result = connector.connect_and_stream().await;
+            match result {
+                Ok(_) => {
+                    eprintln!("[WEBSOCKET] Connection closed normally");
+                    break;
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    eprintln!("[WEBSOCKET] Error: {}. Reconnecting in 5s...", error_msg);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
+    
+    // 6. Start strategy thread
+    eprintln!("[STRATEGY] Starting strategy thread...");
+    let strategy_config = config.clone();
+    let strategy_backend = backend.clone();
+    let strategy_metrics = metrics.clone();
+    let strategy_shutdown = shutdown_flag.clone();
+    let strategy_market_data = market_data_store.clone();
+    
+    let strategy_handle = tokio::spawn(async move {
+        let generator = SyntheticOpportunityGenerator::new(strategy_config.clone());
+        let executor = SingleExchangeExecutor::new(strategy_backend.clone());
+        
+        eprintln!("[STRATEGY] ✅ Strategy thread started");
+        eprintln!("");
+        
+        let mut opportunity_count = 0;
+        let mut trade_count = 0;
+        
+        loop {
+            if strategy_shutdown.load(Ordering::Relaxed) {
+                eprintln!("[STRATEGY] Shutdown signal received");
+                break;
+            }
+            
+            // Pop market update from queue (non-blocking)
+            if let Some(update) = consumer.pop() {
+                // Update market data store
+                {
+                    let mut store = strategy_market_data.write().unwrap();
+                    store.update(update.symbol_id, update.bid, update.ask, update.timestamp_us);
+                }
+                
+                // Map symbol_id to symbol name
+                let symbol_name = match update.symbol_id {
+                    0 => "BTCUSDT",
+                    1 => "ETHUSDT",
+                    2 => "SOLUSDT",
+                    _ => continue,
+                };
+                
+                // Try to generate synthetic opportunity
+                if let Some(opp) = generator.generate_opportunity(symbol_name, update.bid, update.ask) {
+                    opportunity_count += 1;
+                    strategy_metrics.record_opportunity();
+                    
+                    eprintln!("[STRATEGY] Opportunity #{}: {} | Spread: {:.2} bps | Confidence: {}",
+                        opportunity_count, opp.symbol, opp.spread_bps, opp.confidence_score);
+                    
+                    // Execute trade
+                    let available_capital = 10000.0;
+                    let position_size = strategy_config.estimated_position_size;
+                    
+                    match executor.execute_synthetic_trade(&opp, available_capital, position_size).await {
+                        Ok(_) => {
+                            trade_count += 1;
+                            strategy_metrics.record_success();
+                            eprintln!("[STRATEGY] ✅ Trade #{} executed successfully", trade_count);
+                        }
+                        Err(e) => {
+                            strategy_metrics.record_failure();
+                            eprintln!("[STRATEGY] ❌ Trade failed: {}", e);
+                        }
+                    }
+                    
+                    // Enforce max concurrent trades limit
+                    if trade_count >= strategy_config.max_concurrent_trades {
+                        eprintln!("[STRATEGY] Max concurrent trades ({}) reached. Pausing...",
+                            strategy_config.max_concurrent_trades);
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                }
+            }
+            
+            // Small sleep to avoid busy-waiting
+            tokio::time::sleep(Duration::from_micros(100)).await;
+        }
+        
+        eprintln!("[STRATEGY] Strategy thread stopped");
+    });
+    
+    // 7. Set up Ctrl+C handler
+    eprintln!("System running. Press Ctrl+C to stop...");
+    eprintln!("");
+    
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            eprintln!("");
+            eprintln!("=== Shutdown Signal Received ===");
+        }
+    }
+    
+    // 8. Graceful shutdown
+    eprintln!("Initiating graceful shutdown...");
+    shutdown_flag.store(true, Ordering::Relaxed);
+    
+    // Wait for threads to finish (with timeout)
+    eprintln!("Waiting for threads to finish...");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let _ = tokio::join!(ws_handle, strategy_handle);
+    }).await.ok();
+    
+    // 9. Print final metrics
+    eprintln!("");
+    eprintln!("=== Final Metrics ===");
+    metrics.report_summary();
+    
+    eprintln!("");
+    eprintln!("Shutdown complete.");
+    
+    Ok(())
+}

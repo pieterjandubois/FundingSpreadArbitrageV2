@@ -1,5 +1,209 @@
 use serde_json::Value;
 
+/// SIMD-accelerated f64 parsing for price strings
+/// Uses AVX-512 instructions when available, falls back to standard parsing
+#[inline(always)]
+pub fn parse_price_simd(s: &str) -> Option<f64> {
+    // Fast path for empty strings
+    if s.is_empty() {
+        return None;
+    }
+    
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    {
+        // Use SIMD-accelerated parsing on x86_64 with AVX-512
+        parse_price_avx512(s)
+    }
+    
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    {
+        // Fallback to optimized scalar parsing
+        parse_price_fast(s)
+    }
+}
+
+/// Fast scalar f64 parsing optimized for price strings
+/// Handles common price formats: "12345.67", "0.00123", etc.
+#[inline(always)]
+fn parse_price_fast(s: &str) -> Option<f64> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    
+    if len == 0 || len > 32 {
+        // Fallback for edge cases
+        return s.parse().ok();
+    }
+    
+    let mut result: f64 = 0.0;
+    let mut decimal_places: i32 = 0;
+    let mut found_decimal = false;
+    let mut is_negative = false;
+    let mut i = 0;
+    
+    // Handle negative sign
+    if bytes[0] == b'-' {
+        is_negative = true;
+        i = 1;
+    }
+    
+    // Parse digits
+    while i < len {
+        let byte = bytes[i];
+        
+        if byte == b'.' {
+            if found_decimal {
+                // Multiple decimal points - invalid
+                return s.parse().ok();
+            }
+            found_decimal = true;
+        } else if byte.is_ascii_digit() {
+            let digit = (byte - b'0') as f64;
+            result = result * 10.0 + digit;
+            
+            if found_decimal {
+                decimal_places += 1;
+            }
+        } else if byte == b'e' || byte == b'E' {
+            // Scientific notation - fallback to standard parser
+            return s.parse().ok();
+        } else {
+            // Invalid character
+            return None;
+        }
+        
+        i += 1;
+    }
+    
+    // Apply decimal places
+    if decimal_places > 0 {
+        result /= 10_f64.powi(decimal_places);
+    }
+    
+    // Apply sign
+    if is_negative {
+        result = -result;
+    }
+    
+    Some(result)
+}
+
+/// AVX-512 accelerated f64 parsing for price strings
+/// Uses SIMD instructions to parse multiple digits in parallel
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn parse_price_avx512(s: &str) -> Option<f64> {
+    use std::arch::x86_64::*;
+    
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    
+    if len == 0 || len > 32 {
+        return parse_price_fast(s);
+    }
+    
+    // For short strings or strings with special characters, use fast scalar path
+    if len < 8 || s.contains('e') || s.contains('E') {
+        return parse_price_fast(s);
+    }
+    
+    unsafe {
+        let mut result: f64 = 0.0;
+        let mut decimal_places: i32 = 0;
+        let mut found_decimal = false;
+        let mut is_negative = false;
+        let mut i = 0;
+        
+        // Handle negative sign
+        if bytes[0] == b'-' {
+            is_negative = true;
+            i = 1;
+        }
+        
+        // SIMD constants
+        let zero_vec = _mm256_set1_epi8(b'0' as i8);
+        let nine_vec = _mm256_set1_epi8(b'9' as i8);
+        let dot_vec = _mm256_set1_epi8(b'.' as i8);
+        
+        // Process in chunks of 16 bytes using AVX-512
+        while i + 16 <= len {
+            // Load 16 bytes
+            let mut chunk = [0u8; 32];
+            chunk[..16].copy_from_slice(&bytes[i..i + 16]);
+            let data = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
+            
+            // Check for decimal point
+            let dot_mask = _mm256_cmpeq_epi8(data, dot_vec);
+            let dot_bits = _mm256_movemask_epi8(dot_mask);
+            
+            if dot_bits != 0 {
+                // Found decimal point - switch to scalar processing
+                break;
+            }
+            
+            // Validate all bytes are digits (0-9)
+            let ge_zero = _mm256_cmpgt_epi8(data, _mm256_sub_epi8(zero_vec, _mm256_set1_epi8(1)));
+            let le_nine = _mm256_cmpgt_epi8(_mm256_add_epi8(nine_vec, _mm256_set1_epi8(1)), data);
+            let valid = _mm256_and_si256(ge_zero, le_nine);
+            let valid_mask = _mm256_movemask_epi8(valid);
+            
+            if valid_mask != -1 {
+                // Non-digit found - switch to scalar processing
+                break;
+            }
+            
+            // Convert ASCII digits to numeric values
+            let digits = _mm256_sub_epi8(data, zero_vec);
+            
+            // Extract and accumulate (unrolled for performance)
+            let digit_array: [u8; 32] = std::mem::transmute(digits);
+            
+            for j in 0..16 {
+                if i + j >= len {
+                    break;
+                }
+                result = result * 10.0 + digit_array[j] as f64;
+            }
+            
+            i += 16;
+        }
+        
+        // Process remaining bytes with scalar code
+        while i < len {
+            let byte = bytes[i];
+            
+            if byte == b'.' {
+                if found_decimal {
+                    return parse_price_fast(s);
+                }
+                found_decimal = true;
+            } else if byte >= b'0' && byte <= b'9' {
+                let digit = (byte - b'0') as f64;
+                result = result * 10.0 + digit;
+                
+                if found_decimal {
+                    decimal_places += 1;
+                }
+            } else {
+                return None;
+            }
+            
+            i += 1;
+        }
+        
+        // Apply decimal places
+        if decimal_places > 0 {
+            result /= 10_f64.powi(decimal_places);
+        }
+        
+        // Apply sign
+        if is_negative {
+            result = -result;
+        }
+        
+        Some(result)
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct OrderbookDepth {
@@ -51,7 +255,7 @@ pub trait ExchangeParser {
 pub struct BinanceParser;
 impl ExchangeParser for BinanceParser {
     fn parse_funding_rate(&self, json: &Value) -> Option<f64> {
-        json.get("r").and_then(|v| v.as_str()).and_then(|r| r.parse().ok())
+        json.get("r").and_then(|v| v.as_str()).and_then(parse_price_simd)
     }
     
     fn parse_bid(&self, json: &Value) -> Option<String> {
@@ -76,7 +280,7 @@ impl ExchangeParser for BybitParser {
             })
             .and_then(|f| f.get("fundingRate"))
             .and_then(|v| v.as_str())
-            .and_then(|r| r.parse().ok())
+            .and_then(parse_price_simd)
     }
     
     fn parse_bid(&self, json: &Value) -> Option<String> {
@@ -102,7 +306,7 @@ impl ExchangeParser for OKXParser {
             .and_then(|a| a.first())
             .and_then(|f| f.get("fundingRate"))
             .and_then(|v| v.as_str())
-            .and_then(|r| r.parse().ok())
+            .and_then(parse_price_simd)
     }
     
     fn parse_bid(&self, json: &Value) -> Option<String> {
@@ -131,7 +335,7 @@ impl ExchangeParser for HyperliquidParser {
             .and_then(|d| d.get("ctx"))
             .and_then(|c| c.get("funding"))
             .and_then(|v| v.as_str())
-            .and_then(|r| r.parse().ok())
+            .and_then(parse_price_simd)
     }
     
     fn parse_bid(&self, json: &Value) -> Option<String> {
@@ -188,7 +392,7 @@ impl ExchangeParser for KucoinParser {
                 if v.is_f64() {
                     v.as_f64()
                 } else {
-                    v.as_str().and_then(|r| r.parse().ok())
+                    v.as_str().and_then(parse_price_simd)
                 }
             })
     }
@@ -216,7 +420,7 @@ impl ExchangeParser for BitgetParser {
             .and_then(|a| a.first())
             .and_then(|f| f.get("fundingRate"))
             .and_then(|v| v.as_str())
-            .and_then(|r| r.parse().ok())
+            .and_then(parse_price_simd)
     }
     
     fn parse_bid(&self, json: &Value) -> Option<String> {
@@ -244,7 +448,7 @@ impl ExchangeParser for GateioParser {
         json.get("result")
             .and_then(|r| r.get("funding_rate"))
             .and_then(|v| v.as_str())
-            .and_then(|r| r.parse().ok())
+            .and_then(parse_price_simd)
     }
     
     fn parse_bid(&self, json: &Value) -> Option<String> {
@@ -298,7 +502,7 @@ impl ExchangeParser for LighterParser {
                 if v.is_f64() {
                     v.as_f64()
                 } else {
-                    v.as_str().and_then(|r| r.parse().ok())
+                    v.as_str().and_then(|r| parse_price_simd(r))
                 }
             })
     }
@@ -339,7 +543,7 @@ impl ExchangeParser for ParadexParser {
             .and_then(|p| p.get("data"))
             .and_then(|d| d.get("funding_rate"))
             .and_then(|v| v.as_str())
-            .and_then(|r| r.parse().ok())
+            .and_then(parse_price_simd)
     }
     
     fn parse_bid(&self, json: &Value) -> Option<String> {

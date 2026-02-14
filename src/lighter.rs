@@ -27,7 +27,11 @@ impl LighterPerpsConnector {
         }
     }
 
-    pub async fn run(client: &reqwest::Client, tx: mpsc::Sender<(String, String)>) -> Result<(), DynError> {
+    pub async fn run(
+        client: &reqwest::Client, 
+        tx: mpsc::Sender<(String, String)>,
+        _market_producer: Option<crate::strategy::pipeline::MarketProducer>,
+    ) -> Result<(), DynError> {
         Self::connection_check(client).await?;
 
         let markets = fetch_markets(client).await?;
@@ -98,12 +102,24 @@ async fn run_batch(worker_id: usize, markets: &[String], tx: mpsc::Sender<(Strin
                     None => break,
                 };
 
-                if !msg.is_text() {
-                    continue;
-                }
-
-                let text = msg.into_text()?;
-                let v: serde_json::Value = match serde_json::from_str(&text) {
+                // Zero-copy WebSocket message handling (Requirement 8.1, 8.3, 8.4)
+                // Work directly with bytes, avoiding String allocation
+                let bytes = match msg {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        // Convert String to bytes (unavoidable with tungstenite's API)
+                        text.into_bytes()
+                    }
+                    tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                        // Binary messages can be used directly
+                        bytes
+                    }
+                    _ => continue,
+                };
+                
+                // SIMD-accelerated JSON parsing (Requirement 8.2)
+                // Parse directly from bytes without intermediate String allocation
+                let mut bytes_mut = bytes;
+                let v: serde_json::Value = match simd_json::serde::from_slice(&mut bytes_mut) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -116,7 +132,7 @@ async fn run_batch(worker_id: usize, markets: &[String], tx: mpsc::Sender<(Strin
                 if !first_data_logged {
                     first_data_logged = true;
                     println!("Lighter ws[{}] first data message received", worker_id);
-                    println!("Lighter ws[{}] sample message: {}", worker_id, &text[..std::cmp::min(500, text.len())]);
+                    // Note: Cannot log message content without String allocation
                 }
 
                 let market_id = if channel.starts_with("market_stats/") {
